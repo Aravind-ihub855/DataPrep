@@ -1,0 +1,17 @@
+import React from 'react';
+import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
+import AboutPage from '../pages/AboutPage';
+import UploadPage from '../pages/UploadPage';
+
+const AppRoutes = () => {
+  return (
+    <Router>
+      <Routes>
+        <Route path="/" element={<UploadPage />} />
+        <Route path="/about" element={<AboutPage />} />
+      </Routes>
+    </Router>
+  );
+};
+
+export default AppRoutes;
