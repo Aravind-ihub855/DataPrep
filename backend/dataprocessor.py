@@ -27,11 +27,17 @@ def sanitize_column_name(name):
     """Sanitize column names for SQL compatibility."""
     return re.sub(r'[^a-zA-Z0-9_]', '_', str(name)).lower()
 
-def generate_table_name(file_name):
-    """Generate a unique table name based on file name and timestamp."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_name = re.sub(r'[^a-zA-Z0-9]', '_', file_name.split('.')[0]).lower()
-    return f"{base_name}_{timestamp}"
+def generate_table_name(file_name: str) -> str:
+    """Generate a clean table name from file name."""
+    # Take only base name (remove extension)
+    base_name = file_name.split('.')[0]
+    # Replace non-alphanumeric with underscore
+    base_name = re.sub(r'[^a-zA-Z0-9]', '_', base_name).lower()
+    # Replace multiple underscores with single one
+    base_name = re.sub(r'_+', '_', base_name)
+    # Strip leading/trailing underscores
+    base_name = base_name.strip('_')
+    return base_name
 
 def get_table_schema(conn, table_name):
     """Retrieve schema of an existing table from Supabase."""
@@ -187,9 +193,6 @@ def process_csv(content, file_name, llm):
         
         # Generate IDs
         cursor = conn.cursor()
-        cursor.execute("SELECT COALESCE(MAX(batch_id), 0)+1 AS batch_id FROM metadata_operations")
-        batch_id = cursor.fetchone()['batch_id']
-        
         if target_table:
             # Reuse file_id for existing table
             file_id = get_file_id_for_table(conn, target_table)
@@ -200,6 +203,10 @@ def process_csv(content, file_name, llm):
             # New table, new file_id
             cursor.execute("SELECT COALESCE(MAX(file_id), 0)+1 AS file_id FROM metadata_operations")
             file_id = cursor.fetchone()['file_id']
+        
+        # Generate batch_id for this file_id
+        cursor.execute("SELECT COALESCE(MAX(batch_id), 0)+1 AS batch_id FROM metadata_operations WHERE file_id = %s", (file_id,))
+        batch_id = cursor.fetchone()['batch_id']
         
         # Determine run_id (increment based on checksum)
         run_id = get_run_id_for_file(conn, file_name, batch_id, checksum)

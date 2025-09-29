@@ -9,7 +9,6 @@ import os
 from dataprocessor import sanitize_column_name, generate_table_name, process_csv, infer_sql_type, generate_create_table_query, compute_row_hash, get_table_schema, schemas_match, get_all_tables, get_file_id_for_table, get_run_id_for_file
 import hashlib
 
-
 app = FastAPI(title="FastAPI + Supabase Postgres")
 
 app.add_middleware(
