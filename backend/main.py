@@ -1,4 +1,3 @@
-
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from db import get_connection
@@ -7,7 +6,7 @@ import pandas as pd
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_google_genai import ChatGoogleGenerativeAI
 import os
-from dataprocessor import sanitize_column_name,generate_table_name,process_csv, infer_sql_type, generate_create_table_query, compute_row_hash, get_table_schema, schemas_match, get_all_tables, get_file_id_for_table, get_run_id_for_file
+from dataprocessor import sanitize_column_name, generate_table_name, process_csv, infer_sql_type, generate_create_table_query, compute_row_hash, get_table_schema, schemas_match, get_all_tables, get_file_id_for_table, get_run_id_for_file
 
 app = FastAPI(title="FastAPI + Supabase Postgres")
 
@@ -87,6 +86,13 @@ async def upload_file(file: UploadFile = File(...)):
             "run_id": result['run_id']
         }
     except Exception as e:
+        if str(e) == "No new rows to insert (all rows are duplicates).":
+            return {
+                "message": "No new rows inserted: all rows in the file are duplicates.",
+                "file_id": None,
+                "batch_id": None,
+                "run_id": None
+            }
         raise HTTPException(status_code=400, detail=f"Error processing file: {str(e)}")
 
 @app.post("/upload-with-details/")
@@ -97,9 +103,6 @@ async def upload_file_with_details(file: UploadFile = File(...)):
     try:
         content = await file.read()
         df = pd.read_csv(io.BytesIO(content))
-        date_columns = [col for col in df.columns if df[col].astype(str).str.match(r'\d{2}-\d{2}-\d{4}').any()]
-        for col in date_columns:
-            df[col] = pd.to_datetime(df[col], format='%d-%m-%Y', errors='coerce')
         
         # Infer data types
         inferred_types = [(col, infer_sql_type(df[col].dtype, df, col)) for col in df.columns]
@@ -160,6 +163,24 @@ async def upload_file_with_details(file: UploadFile = File(...)):
             }
         }
     except Exception as e:
+        if str(e) == "No new rows to insert (all rows are duplicates).":
+            return {
+                "message": "No new rows inserted: all rows in the file are duplicates.",
+                "file_id": None,
+                "batch_id": None,
+                "run_id": None,
+                "inferred_types": inferred_types,
+                "sample_row_numbers": sample_row_numbers,
+                "schema_query": None,
+                "inserted_rows": [],
+                "metadata": {
+                    "table_name": None,
+                    "file_id": None,
+                    "batch_id": None,
+                    "run_id": None,
+                    "row_count": 0
+                }
+            }
         raise HTTPException(status_code=400, detail=f"Error processing file: {str(e)}")
 
 @app.on_event("startup")

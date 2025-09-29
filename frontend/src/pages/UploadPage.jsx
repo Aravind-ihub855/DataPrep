@@ -82,7 +82,15 @@ const UploadPage = () => {
 
         {/* Message Display */}
         {message && (
-          <p className={`text-sm ${message.includes("failed") ? "text-red-500" : "text-green-500"} mb-6`}>
+          <p
+            className={`text-sm mb-6 ${
+              message.includes("failed")
+                ? "text-red-500"
+                : message.includes("No new rows inserted")
+                ? "text-yellow-500"
+                : "text-green-500"
+            }`}
+          >
             {message}
           </p>
         )}

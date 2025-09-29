@@ -140,14 +140,14 @@ def get_file_id_for_table(conn, target_table):
     cursor.close()
     return result['file_id'] if result else None
 
-def get_run_id_for_file(conn, file_name, batch_id):
-    """Get the next run_id for the same file name in the same batch."""
+def get_run_id_for_file(conn, file_name, batch_id, checksum):
+    """Get the next run_id for the file based on its checksum."""
     cursor = conn.cursor()
     cursor.execute("""
         SELECT COALESCE(MAX(run_id), 0) + 1 AS run_id
         FROM metadata_operations
-        WHERE table_name LIKE %s AND batch_id = %s
-    """, (f"%{file_name.split('.')[0]}%", batch_id))
+        WHERE checksum = %s
+    """, (checksum,))
     run_id = cursor.fetchone()['run_id']
     cursor.close()
     return run_id
@@ -171,7 +171,7 @@ def process_csv(content, file_name, llm):
         if cursor.fetchone():
             cursor.close()
             conn.close()
-            raise Exception("File already processed (duplicate checksum).")
+            raise Exception("No new rows to insert (all rows are duplicates).")
         
         # Infer CSV schema
         csv_schema = [(sanitize_column_name(col), infer_sql_type(df[col].dtype, df, col)) for col in df.columns]
@@ -201,8 +201,8 @@ def process_csv(content, file_name, llm):
             cursor.execute("SELECT COALESCE(MAX(file_id), 0)+1 AS file_id FROM metadata_operations")
             file_id = cursor.fetchone()['file_id']
         
-        # Determine run_id (increment if same file name)
-        run_id = get_run_id_for_file(conn, file_name, batch_id)
+        # Determine run_id (increment based on checksum)
+        run_id = get_run_id_for_file(conn, file_name, batch_id, checksum)
         cursor.close()
         
         # If no matching table, create a new one
