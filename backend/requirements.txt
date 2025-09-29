@@ -1,0 +1,17 @@
+# FastAPI + Server
+fastapi
+uvicorn
+
+# Database
+psycopg2-binary
+python-dotenv
+
+# Data handling
+pandas
+
+# LangChain + Google GenAI
+langchain
+langchain-google-genai
+
+# Utils
+python-multipart   # for UploadFile support in FastAPI
