@@ -17,6 +17,7 @@ const UploadPage = () => {
   const [expandedSection, setExpandedSection] = useState(null);
   const [batchFileIds, setBatchFileIds] = useState([]);
   const [selectedBatchId, setSelectedBatchId] = useState(null);
+  const [selectedFileId, setSelectedFileId] = useState(null);
   const [batchData, setBatchData] = useState(null);
   const [showConfirmDialog, setShowConfirmDialog] = useState(false);
   const [step, setStep] = useState(0);
@@ -35,6 +36,9 @@ const UploadPage = () => {
     });
     setStep(0);
     setShowConfirmDialog(false);
+    setBatchData(null); // Clear batch preview
+    setSelectedBatchId(null); // Clear selected batch
+    setSelectedFileId(null); // Clear selected file
   };
 
   const handleUpload = async () => {
@@ -78,7 +82,7 @@ const UploadPage = () => {
         method: "POST",
         body: formData3,
       });
-      if (!res3.ok) throw new Error(`HTTP error! status: ${res3.status}`);
+      if (!res1.ok) throw new Error(`HTTP error! status: ${res3.status}`);
       const data3 = await res3.json();
       setDetails((prev) => ({ ...prev, schema_query: data3.schema_query, target_table: data3.target_table }));
       setStep(3);
@@ -134,6 +138,7 @@ const UploadPage = () => {
       setMessage(data5.message);
       setStep(5);
       setShowConfirmDialog(false);
+      fetchBatchFileIds(); // Refresh batch/file IDs after insert
     } catch (err) {
       setMessage("Upload failed: " + err.message);
       setStep(0);
@@ -153,13 +158,14 @@ const UploadPage = () => {
     }
   };
 
-  const handlePreviewBatch = async (batchId) => {
+  const handlePreviewBatch = async (batchId, fileId) => {
     try {
-      const res = await fetch(`http://localhost:8000/preview-batch-data/${batchId}`);
+      const res = await fetch(`http://localhost:8000/preview-batch-data/${batchId}?file_id=${fileId}`);
       if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
       const data = await res.json();
       setBatchData(data);
       setSelectedBatchId(batchId);
+      setSelectedFileId(fileId);
     } catch (err) {
       setMessage("Failed to preview batch data: " + err.message);
     }
@@ -176,6 +182,7 @@ const UploadPage = () => {
         setMessage(data.message);
         setBatchData(null);
         setSelectedBatchId(null);
+        setSelectedFileId(null);
         fetchBatchFileIds();
       } catch (err) {
         setMessage("Failed to delete batch data: " + err.message);
@@ -191,7 +198,6 @@ const UploadPage = () => {
     setExpandedSection(expandedSection === section ? null : section);
   };
 
-  // Organize batchFileIds into a hierarchy
   const organizedData = batchFileIds.reduce((acc, { file_id, batch_id }) => {
     if (!acc[file_id]) {
       acc[file_id] = [];
@@ -216,9 +222,9 @@ const UploadPage = () => {
                 {batchIds.map((batchId) => (
                   <li key={batchId} className="flex items-center justify-between">
                     <button
-                      onClick={() => handlePreviewBatch(batchId)}
+                      onClick={() => handlePreviewBatch(batchId, fileId)}
                       className={`flex items-center gap-2 text-sm text-blue-600 hover:text-blue-800 ${
-                        selectedBatchId === batchId ? "font-bold" : ""
+                        selectedBatchId === batchId && selectedFileId === fileId ? "font-bold" : ""
                       }`}
                     >
                       <File className="w-4 h-4" />
@@ -290,11 +296,11 @@ const UploadPage = () => {
           {/* Data Preview */}
           {batchData && (
             <div className="mb-8 w-full">
-              <h3 className="text-xl font-semibold text-gray-800 mb-4">Batch {selectedBatchId} Preview</h3>
-              <div className="bg-gray-50 rounded-lg p-4 overflow-x-auto shadow-sm">
+              <h3 className="text-xl font-semibold text-gray-800 mb-4">Batch {selectedBatchId} (File {selectedFileId}) Preview</h3>
+              <div className="bg-gray-50 rounded-lg p-4 max-h-96 overflow-y-auto shadow-sm">
                 <table className="w-full text-sm text-gray-700">
                   <thead>
-                    <tr className="bg-gray-100">
+                    <tr className="bg-gray-100 sticky top-0">
                       {batchData.rows.length > 0 &&
                         Object.keys(batchData.rows[0]).map((key) => (
                           <th key={key} className="p-3 text-left font-semibold border-b">{key}</th>
@@ -439,10 +445,10 @@ const UploadPage = () => {
       {/* Confirmation Dialog for Duplicates */}
       {showConfirmDialog && details.has_duplicates && (
         <div className="fixed inset-0 bg-gray-900 bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-xl p-2 max-w-3xl w-full shadow-2xl">
-            <h2 className="text-2xl font-bold text-gray-900 mb-2">{details.message}</h2>
+          <div className="bg-white rounded-xl p-8 max-w-3xl w-full shadow-2xl">
+            <h2 className="text-2xl font-bold text-gray-900 mb-6">{details.message}</h2>
             <p className="text-gray-700 mb-4">Preview of duplicate rows (up to 5):</p>
-            <div className="bg-gray-50 rounded-lg p-1 mb-2 overflow-x-auto shadow-sm">
+            <div className="bg-gray-50 rounded-lg p-4 mb-6 overflow-x-auto shadow-sm">
               <table className="w-full text-sm text-gray-700">
                 <thead>
                   <tr className="bg-gray-100">
@@ -463,7 +469,7 @@ const UploadPage = () => {
                 </tbody>
               </table>
             </div>
-            <p className="text-gray-700 mb-2">Proceed with inserting unique rows?</p>
+            <p className="text-gray-700 mb-6">Proceed with inserting unique rows?</p>
             <div className="flex gap-4 justify-end">
               <button
                 onClick={() => proceedWithInsert(true)}

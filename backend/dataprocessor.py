@@ -10,9 +10,8 @@ import io
 def infer_sql_type(dtype, sample_data, col_name):
     """Map pandas dtype to SQL type, refined with sample data."""
     if pd.api.types.is_integer_dtype(dtype):
-        # Check max absolute value in sample data
         max_val = sample_data[col_name].abs().max()
-        if pd.isna(max_val) or max_val <= 2147483647:  # INTEGER max value
+        if pd.isna(max_val) or max_val <= 2147483647:
             return "INTEGER"
         else:
             return "BIGINT"
@@ -25,17 +24,16 @@ def infer_sql_type(dtype, sample_data, col_name):
 
 def sanitize_column_name(name):
     """Sanitize column names for SQL compatibility."""
-    return re.sub(r'[^a-zA-Z0-9_]', '_', str(name)).lower()
+    name = re.sub(r'[^a-zA-Z0-9_]', '_', str(name)).lower()
+    if name[0].isdigit():
+        name = f"col_{name}"
+    return name
 
 def generate_table_name(file_name: str) -> str:
     """Generate a clean table name from file name."""
-    # Take only base name (remove extension)
     base_name = file_name.split('.')[0]
-    # Replace non-alphanumeric with underscore
     base_name = re.sub(r'[^a-zA-Z0-9]', '_', base_name).lower()
-    # Replace multiple underscores with single one
     base_name = re.sub(r'_+', '_', base_name)
-    # Strip leading/trailing underscores
     base_name = base_name.strip('_')
     return base_name
 
@@ -67,21 +65,13 @@ def get_all_tables(conn):
 def schemas_match(csv_schema, table_schema):
     """Check if CSV schema matches table schema, ignoring system columns."""
     system_columns = {'id', 'file_id', 'batch_id', 'run_id', 'ingestion_timestamp', 'row_hash'}
-    
-    # Filter out system columns from table schema
     table_columns = {k: v for k, v in table_schema.items() if k not in system_columns}
-    
-    # Convert CSV schema to match PostgreSQL types
     csv_columns = {col: dtype.lower() for col, dtype in csv_schema}
-    
-    # Ensure same columns and types
     if csv_columns.keys() != table_columns.keys():
         return False
-    
     for col in csv_columns:
         csv_type = csv_columns[col]
         table_type = table_columns[col].lower()
-        # Map PostgreSQL types to our inferred types for comparison
         type_mapping = {
             'integer': 'integer',
             'bigint': 'bigint',
@@ -98,8 +88,6 @@ def generate_create_table_query(table_name, df, llm):
     """Generate CREATE TABLE query using LangChain and Gemini, including sample data."""
     columns = [(sanitize_column_name(col), infer_sql_type(df[col].dtype, df, col)) for col in df.columns]
     columns_info = "\n".join([f"{col[0]}: {col[1]}" for col in columns])
-    
-    # Sample up to 10 random rows (or all if fewer than 10)
     sample_size = min(10, len(df))
     sample_data = df.sample(n=sample_size, random_state=42) if sample_size < len(df) else df
     sample_data_str = sample_data.to_csv(index=False, header=True)
@@ -165,13 +153,9 @@ def process_csv(content, file_name, llm):
         raise Exception("Database connection failed")
     
     try:
-        # Read CSV without date parsing
         df = pd.read_csv(io.BytesIO(content))
-        
-        # Compute file checksum
         checksum = hashlib.sha256(content).hexdigest()
         
-        # Check for duplicate file
         cursor = conn.cursor()
         cursor.execute("SELECT checksum FROM metadata_operations WHERE checksum = %s", (checksum,))
         if cursor.fetchone():
@@ -179,10 +163,7 @@ def process_csv(content, file_name, llm):
             conn.close()
             raise Exception("No new rows to insert (all rows are duplicates).")
         
-        # Infer CSV schema
         csv_schema = [(sanitize_column_name(col), infer_sql_type(df[col].dtype, df, col)) for col in df.columns]
-        
-        # Check for matching table
         tables = get_all_tables(conn)
         target_table = None
         for table in tables:
@@ -191,28 +172,21 @@ def process_csv(content, file_name, llm):
                 target_table = table
                 break
         
-        # Generate IDs
         cursor = conn.cursor()
         if target_table:
-            # Reuse file_id for existing table
             file_id = get_file_id_for_table(conn, target_table)
             if not file_id:
                 cursor.execute("SELECT COALESCE(MAX(file_id), 0)+1 AS file_id FROM metadata_operations")
                 file_id = cursor.fetchone()['file_id']
         else:
-            # New table, new file_id
             cursor.execute("SELECT COALESCE(MAX(file_id), 0)+1 AS file_id FROM metadata_operations")
             file_id = cursor.fetchone()['file_id']
         
-        # Generate batch_id for this file_id
         cursor.execute("SELECT COALESCE(MAX(batch_id), 0)+1 AS batch_id FROM metadata_operations WHERE file_id = %s", (file_id,))
         batch_id = cursor.fetchone()['batch_id']
-        
-        # Determine run_id (increment based on checksum)
         run_id = get_run_id_for_file(conn, file_name, batch_id, checksum)
         cursor.close()
         
-        # If no matching table, create a new one
         if not target_table:
             target_table = generate_table_name(file_name)
             create_table_query = generate_create_table_query(target_table, df, llm)
@@ -221,7 +195,6 @@ def process_csv(content, file_name, llm):
             conn.commit()
             cursor.close()
         
-        # Add system columns
         df['file_id'] = file_id
         df['batch_id'] = batch_id
         df['run_id'] = run_id
@@ -229,7 +202,6 @@ def process_csv(content, file_name, llm):
         df['row_hash'] = df.apply(compute_row_hash, axis=1)
         df.columns = [sanitize_column_name(col) for col in df.columns]
         
-        # Check for duplicate rows
         cursor = conn.cursor()
         cursor.execute(f"SELECT row_hash FROM {target_table}")
         existing_hashes = {row['row_hash'] for row in cursor.fetchall()}
@@ -240,21 +212,19 @@ def process_csv(content, file_name, llm):
             conn.close()
             raise Exception("No new rows to insert (all rows are duplicates).")
         
-        # Insert new rows
         columns = new_rows.columns.tolist()
-        columns_sql = ", ".join(columns)
+        quoted_columns = [f'"{col}"' for col in columns]  # Quote column names
+        columns_sql = ", ".join(quoted_columns)
         placeholders = ", ".join(["%s"] * len(columns))
         insert_query = f"INSERT INTO {target_table} ({columns_sql}) VALUES ({placeholders})"
         
         cursor = conn.cursor()
         for _, row in new_rows.iterrows():
-            # Handle NaN/NaT as strings
             row_data = [str(row[col]) if pd.isna(row[col]) else row[col] for col in columns]
             cursor.execute(insert_query, tuple(row_data))
         
         conn.commit()
         
-        # Update metadata_operations
         cursor.execute("""
             INSERT INTO metadata_operations (table_name, file_id, batch_id, run_id, operation_type, checksum, hash_key, row_count)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -282,5 +252,6 @@ def process_csv(content, file_name, llm):
         }
     
     except Exception as e:
-        conn.close()
+        if conn:
+            conn.close()
         raise e

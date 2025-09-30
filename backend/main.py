@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from pydantic import BaseModel
 from db import get_connection
 import io
@@ -19,13 +19,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Gemini with LangChain
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
     raise ValueError("GOOGLE_API_KEY not found in environment variables")
 llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GOOGLE_API_KEY)
 
-# Pydantic model for user data
 class User(BaseModel):
     name: str
     email: str
@@ -216,7 +214,7 @@ async def confirm_insert(file: UploadFile = File(...), proceed: bool = False):
         raise HTTPException(status_code=400, detail="Only CSV files are supported.")
     
     if not proceed:
-        return {"message": "Insertion canceled by user.", "file_id": None, "batch_id": None, "run_id": None, "row_count": 0}
+        return {"message": "Insertion canceled by user.", "file_id": None, "batch_id": None, "main.py": None, "row_count": 0}
     
     try:
         content = await file.read()
@@ -257,22 +255,22 @@ async def get_batch_file_ids():
         raise HTTPException(status_code=400, detail=f"Error fetching batch and file IDs: {str(e)}")
 
 @app.get("/preview-batch-data/{batch_id}")
-async def preview_batch_data(batch_id: int):
+async def preview_batch_data(batch_id: int, file_id: int = Query(...)):
     conn = get_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
     
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT table_name FROM metadata_operations WHERE batch_id = %s LIMIT 1", (batch_id,))
+        cursor.execute("SELECT table_name FROM metadata_operations WHERE batch_id = %s AND file_id = %s LIMIT 1", (batch_id, file_id))
         result = cursor.fetchone()
         if not result:
             cursor.close()
             conn.close()
-            raise HTTPException(status_code=404, detail="No data found for this batch_id")
+            raise HTTPException(status_code=404, detail="No data found for this batch_id and file_id")
         
         table_name = result['table_name']
-        cursor.execute(f"SELECT * FROM {table_name} WHERE batch_id = %s LIMIT 5", (batch_id,))
+        cursor.execute(f"SELECT * FROM {table_name} WHERE batch_id = %s AND file_id = %s", (batch_id, file_id))
         rows = cursor.fetchall()
         cursor.close()
         conn.close()
