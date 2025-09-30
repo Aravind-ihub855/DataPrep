@@ -135,13 +135,14 @@ def get_file_id_for_table(conn, target_table):
     return result['file_id'] if result else None
 
 def get_run_id_for_file(conn, file_name, batch_id, checksum):
-    """Get the next run_id for the file based on its checksum."""
+    """Get the next run_id for the file based on its table name."""
+    table_name = generate_table_name(file_name)
     cursor = conn.cursor()
     cursor.execute("""
         SELECT COALESCE(MAX(run_id), 0) + 1 AS run_id
         FROM metadata_operations
-        WHERE checksum = %s
-    """, (checksum,))
+        WHERE table_name = %s
+    """, (table_name,))
     run_id = cursor.fetchone()['run_id']
     cursor.close()
     return run_id
