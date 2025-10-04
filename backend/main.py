@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Form
 from pydantic import BaseModel
 from db import get_connection
 import io
@@ -6,7 +6,11 @@ import pandas as pd
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_google_genai import ChatGoogleGenerativeAI
 import os
-from dataprocessor import sanitize_column_name, generate_table_name, process_csv, infer_sql_type, generate_create_table_query, compute_row_hash, get_table_schema, schemas_match, get_all_tables, get_file_id_for_table, get_run_id_for_file
+from dataprocessor import (
+    sanitize_column_name, generate_table_name, process_csv, infer_sql_type, 
+    generate_create_table_query, get_table_schema, schemas_match, get_all_tables, 
+    get_file_id_for_file, get_batch_id, get_run_id, compute_data_hash, get_existing_data_hashes
+)
 import hashlib
 
 app = FastAPI(title="FastAPI + Supabase Postgres")
@@ -71,44 +75,50 @@ def get_users():
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/upload/")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(file: UploadFile = File(...), table_name: str = Form(...), primary_column: str = Form(...), target_table: str = Form(None)):
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="Only CSV files are supported.")
     
+    final_table = target_table if target_table else table_name
+    
     try:
         content = await file.read()
-        result = process_csv(content, file.filename, llm)
+        result = process_csv(content, file.filename, llm, final_table, primary_column)
         return {
             "message": f"File uploaded successfully. Data inserted into table '{result['table_name']}' with {result['row_count']} rows.",
             "file_id": result['file_id'],
             "batch_id": result['batch_id'],
-            "run_id": result['run_id']
+            "run_id": result['run_id'],
+            "table_name": result['table_name']
         }
     except Exception as e:
         if str(e) == "No new rows to insert (all rows are duplicates).":
             return {
-                "message": "No new rows inserted: all rows in the file are duplicates.",
+                "message": "No new rows inserted: all rows are duplicates.",
                 "file_id": None,
                 "batch_id": None,
-                "run_id": None
+                "run_id": None,
+                "table_name": None
             }
         raise HTTPException(status_code=400, detail=f"Error processing file: {str(e)}")
 
 @app.post("/infer-types/")
-async def infer_types(file: UploadFile = File(...)):
+async def infer_types(file: UploadFile = File(...), table_name: str = Form(None), primary_column: str = Form(None)):
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="Only CSV files are supported.")
     
     try:
         content = await file.read()
         df = pd.read_csv(io.BytesIO(content))
-        inferred_types = [(col, infer_sql_type(df[col].dtype, df, col)) for col in df.columns]
+        if primary_column and primary_column not in df.columns:
+            raise HTTPException(status_code=400, detail=f"Primary column '{primary_column}' not found in CSV columns: {df.columns.tolist()}")
+        inferred_types = [(sanitize_column_name(col), infer_sql_type(df[col].dtype, df, col)) for col in df.columns]
         return {"inferred_types": inferred_types}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error inferring types: {str(e)}")
 
 @app.post("/sample-rows/")
-async def sample_rows(file: UploadFile = File(...)):
+async def sample_rows(file: UploadFile = File(...), table_name: str = Form(None), primary_column: str = Form(None)):
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="Only CSV files are supported.")
     
@@ -118,52 +128,129 @@ async def sample_rows(file: UploadFile = File(...)):
         sample_size = min(10, len(df))
         sample_data = df.sample(n=sample_size, random_state=42) if sample_size < len(df) else df
         sample_row_numbers = sample_data.index.tolist()
-        return {"sample_row_numbers": sample_row_numbers}
+        return {"sample_row_numbers": sample_row_numbers, "csv_sample_rows": sample_data.to_dict('records')}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error sampling rows: {str(e)}")
 
+@app.get("/get-table-preview/{table_name}")
+async def get_table_preview(table_name: str):
+    conn = get_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    
+    try:
+        cursor = conn.cursor()
+        # Get schema
+        cursor.execute("""
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_name = %s AND table_schema = 'public'
+            ORDER BY ordinal_position
+        """, (table_name,))
+        schema = cursor.fetchall()
+        schema_dict = {row['column_name']: row['data_type'] for row in schema}
+        
+        # Get sample rows
+        cursor.execute(f"SELECT * FROM {table_name} LIMIT 5")
+        sample_rows = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        return {
+            "schema": schema_dict,
+            "sample_rows": sample_rows,
+            "table_name": table_name
+        }
+    except Exception as e:
+        conn.close()
+        raise HTTPException(status_code=400, detail=f"Error fetching table preview: {str(e)}")
+
 @app.post("/generate-schema/")
-async def generate_schema(file: UploadFile = File(...)):
+async def generate_schema(file: UploadFile = File(...), table_name: str = Form(None), primary_column: str = Form(None)):
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="Only CSV files are supported.")
     
     try:
         content = await file.read()
         df = pd.read_csv(io.BytesIO(content))
+        if not table_name:
+            raise HTTPException(status_code=400, detail="Table name is required")
+        if primary_column not in df.columns:
+            raise HTTPException(status_code=400, detail=f"Primary column '{primary_column}' not found in CSV")
+        
         conn = get_connection()
         if not conn:
             raise Exception("Database connection failed")
         
-        csv_schema = [(sanitize_column_name(col), infer_sql_type(df[col].dtype, df, col)) for col in df.columns]
         tables = get_all_tables(conn)
-        target_table = None
-        for table in tables:
-            table_schema = get_table_schema(conn, table)
-            if schemas_match(csv_schema, table_schema):
-                target_table = table
-                break
-        
+        sanitized_primary = sanitize_column_name(primary_column)
         create_table_query = None
-        if not target_table:
-            target_table = generate_table_name(file.filename)
-            create_table_query = generate_create_table_query(target_table, df, llm)
+        matching_table = None
+        csv_sample_rows = None
+        
+        if table_name in tables:
+            table_schema = get_table_schema(conn, table_name)
+            if sanitized_primary not in table_schema:
+                raise HTTPException(status_code=400, detail=f"Primary column '{primary_column}' not in existing table '{table_name}'")
+            csv_schema = [(sanitize_column_name(col), infer_sql_type(df[col].dtype, df, col)) for col in df.columns]
+            if not schemas_match(csv_schema, table_schema):
+                raise HTTPException(status_code=400, detail="Schema mismatch with existing table")
+            target_table = table_name
+        else:
+            # Check for schema matches with existing tables
+            csv_schema = [(sanitize_column_name(col), infer_sql_type(df[col].dtype, df, col)) for col in df.columns]
+            for existing_table in tables:
+                existing_schema = get_table_schema(conn, existing_table)
+                if sanitized_primary in existing_schema and schemas_match(csv_schema, existing_schema):
+                    matching_table = existing_table
+                    break
+            
+            if matching_table:
+                # Get preview for matching table
+                table_preview = await get_table_preview(matching_table)
+                # Get CSV sample
+                sample_size = min(5, len(df))
+                csv_sample = df.head(sample_size).to_dict('records')
+                target_table = table_name  # intended
+                return {
+                    "schema_query": None,
+                    "target_table": target_table,
+                    "matching_table": matching_table,
+                    "match_confirmed": False,
+                    "csv_schema": csv_schema,
+                    "csv_sample_rows": csv_sample,
+                    "existing_schema": table_preview["schema"],
+                    "existing_sample_rows": table_preview["sample_rows"]
+                }
+            else:
+                target_table = table_name
+                df_sanitized = df.copy()
+                df_sanitized.columns = [sanitize_column_name(col) for col in df.columns]
+                create_table_query = generate_create_table_query(target_table, df_sanitized, llm, sanitized_primary)
         
         conn.close()
         return {"schema_query": create_table_query, "target_table": target_table}
     except Exception as e:
-        conn.close()
+        if 'conn' in locals():
+            conn.close()
         raise HTTPException(status_code=400, detail=f"Error generating schema: {str(e)}")
 
 @app.post("/check-duplicates/")
-async def check_duplicates(file: UploadFile = File(...)):
+async def check_duplicates(file: UploadFile = File(...), table_name: str = Form(None), primary_column: str = Form(None), target_table: str = Form(None)):
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="Only CSV files are supported.")
+    
+    final_table = target_table if target_table else table_name
     
     try:
         content = await file.read()
         df = pd.read_csv(io.BytesIO(content))
-        checksum = hashlib.sha256(content).hexdigest()
+        if not final_table:
+            raise HTTPException(status_code=400, detail="Table name is required")
+        if primary_column not in df.columns:
+            raise HTTPException(status_code=400, detail=f"Primary column '{primary_column}' not found in CSV")
         
+        checksum = hashlib.sha256(content).hexdigest()
         conn = get_connection()
         if not conn:
             raise Exception("Database connection failed")
@@ -174,65 +261,99 @@ async def check_duplicates(file: UploadFile = File(...)):
             cursor.close()
             conn.close()
             return {"message": "No new rows to insert: entire file is a duplicate.", "duplicates": [], "has_duplicates": False}
+        cursor.close()
         
-        csv_schema = [(sanitize_column_name(col), infer_sql_type(df[col].dtype, df, col)) for col in df.columns]
         tables = get_all_tables(conn)
-        target_table = None
-        for table in tables:
-            table_schema = get_table_schema(conn, table)
-            if schemas_match(csv_schema, table_schema):
-                target_table = table
-                break
-        
-        if not target_table:
-            cursor.close()
+        if final_table not in tables:
             conn.close()
             return {"message": "All rows are unique (new table will be created).", "duplicates": [], "has_duplicates": False}
         
-        df['row_hash'] = df.apply(compute_row_hash, axis=1)
+        sanitized_primary = sanitize_column_name(primary_column)
+        table_schema = get_table_schema(conn, final_table)
+        if sanitized_primary not in table_schema:
+            conn.close()
+            raise HTTPException(status_code=400, detail=f"Primary column '{primary_column}' not in existing table '{final_table}'")
+        
         df.columns = [sanitize_column_name(col) for col in df.columns]
-        cursor.execute(f"SELECT row_hash FROM {target_table}")
-        existing_hashes = {row['row_hash'] for row in cursor.fetchall()}
-        duplicates = df[df['row_hash'].isin(existing_hashes)].head(5).to_dict(orient='records')
-        new_rows = df[~df['row_hash'].isin(existing_hashes)]
+        csv_schema = [(col, infer_sql_type(df[col].dtype, df, col)) for col in df.columns]
+        if not schemas_match(csv_schema, table_schema):
+            conn.close()
+            raise HTTPException(status_code=400, detail="Schema mismatch with existing table")
         
+        # Check duplicates using primary key
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT {sanitized_primary} FROM {final_table}")
+        existing_primary_values = {row[sanitized_primary] for row in cursor.fetchall()}
         cursor.close()
+        
+        # Check file-level duplicates via metadata hash
+        cursor = conn.cursor()
+        cursor.execute("SELECT hash_key FROM metadata_operations WHERE table_name = %s AND hash_key IN (SELECT hash_key FROM metadata_operations WHERE batch_id != (SELECT MAX(batch_id) FROM metadata_operations WHERE table_name = %s))", (final_table, final_table))
+        existing_hashes = {row['hash_key'] for row in cursor.fetchall()}
+        cursor.close()
+        
+        # Get duplicate rows based on primary key
+        df['primary_key'] = df[sanitized_primary]
+        duplicate_rows = df[df['primary_key'].isin(existing_primary_values)].head(5).to_dict('records')
+        num_duplicates = len(df[df['primary_key'].isin(existing_primary_values)])
+        
         conn.close()
         
-        if new_rows.empty:
-            return {"message": "No new rows to insert: all rows are duplicates.", "duplicates": duplicates, "has_duplicates": True}
-        if duplicates:
-            return {"message": f"Found {len(df) - len(new_rows)} duplicate rows.", "duplicates": duplicates, "has_duplicates": True}
-        return {"message": "All rows are unique.", "duplicates": [], "has_duplicates": False}
+        if num_duplicates == 0:
+            return {"message": "All rows are unique.", "duplicates": [], "has_duplicates": False}
+        else:
+            return {
+                "message": f"Found {num_duplicates} duplicate rows based on primary key.",
+                "duplicates": duplicate_rows,
+                "has_duplicates": True
+            }
     except Exception as e:
-        conn.close()
+        if 'conn' in locals():
+            conn.close()
         raise HTTPException(status_code=400, detail=f"Error checking duplicates: {str(e)}")
 
 @app.post("/confirm-insert/")
-async def confirm_insert(file: UploadFile = File(...), proceed: bool = False):
+async def confirm_insert(
+    file: UploadFile = File(...), 
+    proceed: str = Form("false"), 
+    table_name: str = Form(None), 
+    primary_column: str = Form(None),
+    target_table: str = Form(None)
+):
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="Only CSV files are supported.")
     
-    if not proceed:
-        return {"message": "Insertion canceled by user.", "file_id": None, "batch_id": None, "main.py": None, "row_count": 0}
+    final_table = target_table if target_table else table_name
+    proceed_bool = proceed.lower() == "true"
+    if not proceed_bool:
+        return {
+            "message": "Insertion canceled by user.", 
+            "file_id": None, 
+            "batch_id": None, 
+            "run_id": None, 
+            "table_name": None,
+            "row_count": 0
+        }
     
     try:
         content = await file.read()
-        result = process_csv(content, file.filename, llm)
+        result = process_csv(content, file.filename, llm, final_table, primary_column)
         return {
             "message": f"File uploaded successfully. Data inserted into table '{result['table_name']}' with {result['row_count']} rows.",
             "file_id": result['file_id'],
             "batch_id": result['batch_id'],
             "run_id": result['run_id'],
+            "table_name": result['table_name'],
             "row_count": result['row_count']
         }
     except Exception as e:
         if str(e) == "No new rows to insert (all rows are duplicates).":
             return {
-                "message": "No new rows inserted: all rows in the file are duplicates.",
+                "message": "No new rows inserted: all rows are duplicates.",
                 "file_id": None,
                 "batch_id": None,
                 "run_id": None,
+                "table_name": None,
                 "row_count": 0
             }
         raise HTTPException(status_code=400, detail=f"Error processing file: {str(e)}")
@@ -245,8 +366,8 @@ async def get_batch_file_ids():
     
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT DISTINCT batch_id, file_id FROM metadata_operations WHERE batch_id IS NOT NULL AND file_id IS NOT NULL")
-        ids = [{"batch_id": row['batch_id'], "file_id": row['file_id']} for row in cursor.fetchall()]
+        cursor.execute("SELECT DISTINCT batch_id, file_id, file_name FROM metadata_operations WHERE batch_id IS NOT NULL AND file_id IS NOT NULL")
+        ids = [{"batch_id": row['batch_id'], "file_id": row['file_id'], "file_name": row['file_name']} for row in cursor.fetchall()]
         cursor.close()
         conn.close()
         return {"batch_file_ids": ids}
@@ -316,6 +437,7 @@ async def create_metadata_table():
         meta_id SERIAL PRIMARY KEY,
         table_name VARCHAR(100),
         file_id INTEGER,
+        file_name VARCHAR(255),
         batch_id INTEGER,
         run_id INTEGER,
         operation_type VARCHAR(50),
